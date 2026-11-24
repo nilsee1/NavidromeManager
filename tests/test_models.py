@@ -152,3 +152,86 @@ def test_playlist_to_m3u8_newline_and_slash_sanitization() -> None:
     assert lines[5] == "AC_DC - Track_With_Slashes.flac"
     assert "/" not in lines[5]
     assert "\\" not in lines[5]
+
+
+def test_playlist_to_dict_metadata() -> None:
+    """Verify to_dict() adds schemaVersion: 1 and exportedAt timestamp."""
+    playlist = Playlist(
+        id="pl-test",
+        name="Test Playlist",
+        comment="Comment",
+        owner="testuser",
+        public=True,
+        tracks=[
+            Track(id="t1", title="Song 1", duration=120),
+        ],
+    )
+    d = playlist.to_dict()
+    assert d["schemaVersion"] == 1
+    assert "exportedAt" in d
+    assert d["id"] == "pl-test"
+    assert d["name"] == "Test Playlist"
+    assert d["comment"] == "Comment"
+    assert d["owner"] == "testuser"
+    assert d["public"] is True
+    assert len(d["tracks"]) == 1
+    assert d["tracks"][0]["title"] == "Song 1"
+
+
+def test_playlist_from_export_dict_modern_and_legacy() -> None:
+    """Verify from_export_dict() parses both modern schema v1 and legacy backups."""
+    modern_data = {
+        "schemaVersion": 1,
+        "exportedAt": "2024-01-01T00:00:00Z",
+        "id": "pl-mod",
+        "name": "Modern Playlist",
+        "comment": "Nice songs",
+        "owner": "user1",
+        "public": True,
+        "songCount": 1,
+        "duration": 240,
+        "tracks": [
+            {
+                "id": "trk-1",
+                "title": "Title 1",
+                "artist": "Artist 1",
+                "album": "Album 1",
+                "duration": 240,
+                "trackNumber": 3,
+                "year": 2020,
+                "path": "Artist 1/Album 1/03 Title 1.mp3",
+            }
+        ],
+    }
+    pl = Playlist.from_export_dict(modern_data)
+    assert pl.id == "pl-mod"
+    assert pl.name == "Modern Playlist"
+    assert pl.comment == "Nice songs"
+    assert pl.owner == "user1"
+    assert pl.public is True
+    assert pl.song_count == 1
+    assert pl.duration == 240
+    assert len(pl.tracks) == 1
+    assert pl.tracks[0].title == "Title 1"
+    assert pl.tracks[0].track_number == 3
+
+    # Legacy backup without schemaVersion and with string boolean public
+    legacy_data = {
+        "id": "pl-leg",
+        "name": "Legacy Playlist",
+        "public": "true",
+        "tracks": [
+            {
+                "id": "trk-leg",
+                "title": "Legacy Song",
+                "track": 1,
+            }
+        ],
+    }
+    pl_leg = Playlist.from_export_dict(legacy_data)
+    assert pl_leg.id == "pl-leg"
+    assert pl_leg.name == "Legacy Playlist"
+    assert pl_leg.public is True
+    assert len(pl_leg.tracks) == 1
+    assert pl_leg.tracks[0].track_number == 1
+

@@ -6,7 +6,7 @@ from typing import Any, Optional
 import httpx
 
 from nd_playlists.config import Config
-from nd_playlists.models import Playlist
+from nd_playlists.models import Playlist, Track
 
 
 class SubsonicError(Exception):
@@ -90,27 +90,49 @@ class SubsonicClient:
     def _request(
         self,
         endpoint: str,
-        params: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any] | list[tuple[str, Any]]] = None,
         method: str = "GET",
     ) -> dict[str, Any]:
         """Perform an HTTP request to <NAVIDROME_URL>/rest/<endpoint> and validate the response."""
         clean_endpoint = endpoint.strip().lstrip("/")
         url = f"{self.config.url}/rest/{clean_endpoint}"
 
-        payload = self._get_auth_params()
+        payload_dict: dict[str, Any] = self._get_auth_params()
+        payload_tuples: list[tuple[str, str]] = list(payload_dict.items())
+
         if params:
-            for k, v in params.items():
-                if v is not None:
-                    payload[k] = str(v)
+            if isinstance(params, dict):
+                for k, v in params.items():
+                    if v is None:
+                        continue
+                    if isinstance(v, (list, tuple)):
+                        payload_dict[k] = [str(x) for x in v if x is not None]
+                        for item in v:
+                            if item is not None:
+                                payload_tuples.append((k, str(item)))
+                    else:
+                        payload_dict[k] = str(v)
+                        payload_tuples.append((k, str(v)))
+            elif isinstance(params, (list, tuple)):
+                for k, v in params:
+                    if v is not None:
+                        payload_tuples.append((k, str(v)))
+                        if k in payload_dict:
+                            if isinstance(payload_dict[k], list):
+                                payload_dict[k].append(str(v))
+                            else:
+                                payload_dict[k] = [payload_dict[k], str(v)]
+                        else:
+                            payload_dict[k] = str(v)
 
         try:
             method_upper = method.upper()
             if method_upper == "POST":
-                response = self.client.post(url, data=payload)
+                response = self.client.post(url, data=payload_dict)
             elif method_upper == "GET":
-                response = self.client.get(url, params=payload)
+                response = self.client.get(url, params=payload_tuples)
             else:
-                response = self.client.request(method_upper, url, params=payload)
+                response = self.client.request(method_upper, url, params=payload_tuples)
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise SubsonicTimeoutError(
@@ -197,23 +219,126 @@ class SubsonicClient:
         """Delete a playlist via /rest/deletePlaylist."""
         self._request("deletePlaylist", {"id": playlist_id}, method="POST")
 
+    def get_song(self, song_id: str) -> Optional[Track]:
+        """Fetch song details via /rest/getSong.
+
+        Returns:
+            Track if found, or None if Subsonic error 70 (not found) or empty song.
+        """
+        try:
+            resp = self._request("getSong", {"id": song_id})
+        except SubsonicAPIError as exc:
+            if exc.code == 70:
+                return None
+            raise
+
+        song_data = resp.get("song")
+        if not song_data or not isinstance(song_data, dict) or not song_data.get("id"):
+            return None
+        return Track.from_subsonic_dict(song_data)
+
+    def search_songs(self, query: str, count: int = 20) -> list[Track]:
+        """Search songs via /rest/search3.
+
+        Returns:
+            List of matching Track objects.
+        """
+        params = {
+            "query": query,
+            "artistCount": 0,
+            "albumCount": 0,
+            "songCount": count,
+        }
+        resp = self._request("search3", params)
+        search_res = resp.get("searchResult3") or resp.get("searchResult2") or {}
+        raw_songs = search_res.get("song")
+        if raw_songs is None:
+            return []
+        if isinstance(raw_songs, dict):
+            raw_songs = [raw_songs]
+        return [
+            Track.from_subsonic_dict(item)
+            for item in raw_songs
+            if isinstance(item, dict) and item.get("id")
+        ]
+
+    def create_playlist(
+        self,
+        name: Optional[str] = None,
+        playlist_id: Optional[str] = None,
+        song_ids: Optional[list[str]] = None,
+    ) -> Playlist:
+        """Create a new playlist or replace an existing playlist's tracks via /rest/createPlaylist.
+
+        Handles large playlists safely by creating/resetting with the first 100 songs,
+        then appending remaining songs in chunks of 100 via update_playlist.
+        """
+        if not name and not playlist_id:
+            raise SubsonicAPIError(code=-1, message="Either 'name' or 'playlist_id' must be provided.")
+
+        params: dict[str, Any] = {}
+        if playlist_id is not None:
+            params["playlistId"] = playlist_id
+        if name is not None:
+            params["name"] = name
+
+        all_song_ids = song_ids or []
+        first_chunk = all_song_ids[:100]
+        if first_chunk:
+            params["songId"] = first_chunk
+
+        resp = self._request("createPlaylist", params, method="POST")
+
+        playlist_data = resp.get("playlist")
+        target_id: Optional[str] = None
+        if isinstance(playlist_data, dict) and playlist_data.get("id"):
+            target_id = str(playlist_data["id"])
+        elif playlist_id:
+            target_id = playlist_id
+        elif name:
+            target = self.resolve_playlist(name)
+            target_id = target.id
+
+        if not target_id:
+            raise SubsonicAPIError(code=-1, message="Could not determine created playlist ID.")
+
+        if len(all_song_ids) > 100:
+            remaining_chunks = all_song_ids[100:]
+            self.update_playlist(playlist_id=target_id, song_ids_to_add=remaining_chunks)
+            return self.get_playlist(target_id)
+
+        if isinstance(playlist_data, dict) and playlist_data.get("id"):
+            return Playlist.from_subsonic_dict(playlist_data)
+
+        return self.get_playlist(target_id)
+
     def update_playlist(
         self,
         playlist_id: str,
         name: Optional[str] = None,
         comment: Optional[str] = None,
         public: Optional[bool] = None,
+        song_ids_to_add: Optional[list[str]] = None,
     ) -> None:
-        """Update playlist metadata via /rest/updatePlaylist."""
-        params: dict[str, Any] = {"playlistId": playlist_id}
+        """Update playlist metadata and/or add songs via /rest/updatePlaylist."""
+        base_params: dict[str, Any] = {"playlistId": playlist_id}
         if name is not None:
-            params["name"] = name
+            base_params["name"] = name
         if comment is not None:
-            params["comment"] = comment
+            base_params["comment"] = comment
         if public is not None:
-            params["public"] = "true" if public else "false"
+            base_params["public"] = "true" if public else "false"
 
-        self._request("updatePlaylist", params, method="POST")
+        if not song_ids_to_add:
+            self._request("updatePlaylist", base_params, method="POST")
+            return
+
+        chunk_size = 100
+        for i in range(0, len(song_ids_to_add), chunk_size):
+            chunk = song_ids_to_add[i : i + chunk_size]
+            params = dict(base_params) if i == 0 else {"playlistId": playlist_id}
+            params["songIdToAdd"] = chunk
+            self._request("updatePlaylist", params, method="POST")
 
     def resolve_playlist(
         self,
