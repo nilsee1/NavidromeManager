@@ -502,3 +502,321 @@ def test_cli_missing_credentials_error(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(app, ["ping"])
     assert result.exit_code == 1
     assert "Configuration Error" in result.stderr or "Configuration Error" in result.stdout
+
+
+# ==============================================================================
+# Bulk Export and Import CLI Tests
+# ==============================================================================
+
+@respx.mock
+def test_cli_bulk_export_all_and_pattern_and_owner(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+    mock_subsonic_playlist_details_response: dict,
+) -> None:
+    """Verify bulk export options --all, --pattern, --owner, and --output-dir."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+    respx.get("http://navidrome.local:4533/rest/getPlaylist").respond(json=mock_subsonic_playlist_details_response)
+
+    # 1. Export --all to output-dir
+    out_dir_all = tmp_path / "all_exports"
+    res_all = runner.invoke(app, ["export", "--all", "-d", str(out_dir_all)])
+    assert res_all.exit_code == 0
+    assert "Successfully exported 5 playlist(s)" in res_all.stdout
+    assert len(list(out_dir_all.glob("*.json"))) == 5
+
+    # 2. Export --pattern 'Rock*'
+    out_dir_pat = tmp_path / "pat_exports"
+    res_pat = runner.invoke(app, ["export", "--pattern", "Rock*", "-d", str(out_dir_pat)])
+    assert res_pat.exit_code == 0
+    assert "Successfully exported 1 playlist(s)" in res_pat.stdout
+    assert len(list(out_dir_pat.glob("*.json"))) == 1
+
+    # 3. Export --owner 'otheruser'
+    out_dir_owner = tmp_path / "owner_exports"
+    res_owner = runner.invoke(app, ["export", "--all", "--owner", "otheruser", "-d", str(out_dir_owner)])
+    assert res_owner.exit_code == 0
+    assert "Successfully exported 2 playlist(s)" in res_owner.stdout
+    assert len(list(out_dir_owner.glob("*.json"))) == 2
+
+
+@respx.mock
+def test_cli_export_rejects_output_for_multiple_playlists(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+) -> None:
+    """Verify using --output with multiple playlists raises ConfigError."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+
+    res = runner.invoke(app, ["export", "--all", "-o", str(tmp_path / "out.json")])
+    assert res.exit_code == 1
+    assert "Cannot use --output when exporting multiple playlists" in (res.stderr + res.stdout)
+
+
+@respx.mock
+def test_cli_bulk_export_overwrite_force(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+    mock_subsonic_playlist_details_response: dict,
+) -> None:
+    """Verify bulk export respects overwrite protection unless --force is specified."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+    respx.get("http://navidrome.local:4533/rest/getPlaylist").respond(json=mock_subsonic_playlist_details_response)
+
+    out_dir = tmp_path / "force_test"
+    out_dir.mkdir()
+    existing_file = out_dir / "Rock Anthems.json"
+    existing_file.write_text("old", encoding="utf-8")
+
+    # Without --force -> fail
+    res_fail = runner.invoke(app, ["export", "--pattern", "Rock*", "-d", str(out_dir)])
+    assert res_fail.exit_code == 1
+    assert "already exists" in (res_fail.stderr + res_fail.stdout)
+    assert existing_file.read_text(encoding="utf-8") == "old"
+
+    # With --force -> succeed
+    res_force = runner.invoke(app, ["export", "--pattern", "Rock*", "-d", str(out_dir), "--force"])
+    assert res_force.exit_code == 0
+    assert "Successfully exported 1 playlist(s)" in res_force.stdout
+    assert existing_file.read_text(encoding="utf-8") != "old"
+
+
+@respx.mock
+def test_cli_import_single_file_and_dry_run(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+) -> None:
+    """Verify import command with single file, dry-run, and creation."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+    respx.get("http://navidrome.local:4533/rest/getSong").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "song": {"id": "trk-101", "title": "Song One", "artist": "Artist One", "duration": 180},
+            }
+        }
+    )
+    create_route = respx.post("http://navidrome.local:4533/rest/createPlaylist").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "playlist": {"id": "pl-newly-created", "name": "New Mix"},
+            }
+        }
+    )
+
+    playlist_data = {
+        "name": "New Mix",
+        "tracks": [{"id": "trk-101", "title": "Song One", "artist": "Artist One", "duration": 180}],
+    }
+    file_path = tmp_path / "import_me.json"
+    file_path.write_text(json.dumps(playlist_data), encoding="utf-8")
+
+    # 1. Dry run
+    res_dry = runner.invoke(app, ["import", str(file_path), "--dry-run"])
+    assert res_dry.exit_code == 0
+    assert "dry-run" in res_dry.stdout
+    assert not create_route.called
+
+    # 2. Real import
+    res_real = runner.invoke(app, ["import", str(file_path)])
+    assert res_real.exit_code == 0
+    assert "created" in res_real.stdout
+    assert create_route.called
+
+
+@respx.mock
+def test_cli_import_directory_and_report(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+) -> None:
+    """Verify importing a directory discovers files, renders summary table, and generates --report."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+    respx.get("http://navidrome.local:4533/rest/getSong").respond(
+        json={
+            "subsonic-response": {
+                "status": "failed",
+                "version": "1.16.1",
+                "error": {"code": 70, "message": "Song not found"},
+            }
+        }
+    )
+    respx.get("http://navidrome.local:4533/rest/search3").respond(
+        json={"subsonic-response": {"status": "ok", "version": "1.16.1", "searchResult3": {"song": None}}}
+    )
+    respx.post("http://navidrome.local:4533/rest/createPlaylist").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "playlist": {"id": "pl-dir-1", "name": "Dir Playlist"},
+            }
+        }
+    )
+
+    import_dir = tmp_path / "playlists_dir"
+    import_dir.mkdir()
+
+    p1 = import_dir / "01_mix.json"
+    p1.write_text(
+        json.dumps(
+            {
+                "name": "Dir Playlist 1",
+                "tracks": [{"id": "t-missing", "title": "Missing Song", "artist": "Ghost"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    p2 = import_dir / "02_mix.m3u8"
+    p2.write_text(
+        "#EXTM3U\n#PLAYLIST:Dir Playlist 2\n#EXTINF:200,Ghost - Unmatched Track\nghost.mp3\n",
+        encoding="utf-8",
+    )
+
+    report_path = tmp_path / "unmatched_report.json"
+    res = runner.invoke(app, ["import", str(import_dir), "--report", str(report_path)])
+    assert res.exit_code == 0
+    assert "Dir Playlist 1" in res.stdout
+    assert "Dir Playlist 2" in res.stdout
+    assert "Unmatched Tracks" in res.stdout
+    assert "Missing Song" in res.stdout
+    assert "Unmatched Track" in res.stdout
+
+    # Verify report file
+    assert report_path.exists()
+    report_json = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report_json["summary"]["total_unmatched_tracks"] == 2
+    assert len(report_json["playlists"]) == 2
+
+
+@respx.mock
+def test_cli_import_name_override_valid_and_invalid(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+) -> None:
+    """Verify --name works for single file and is rejected for multiple files."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+    create_route = respx.post("http://navidrome.local:4533/rest/createPlaylist").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "playlist": {"id": "pl-renamed", "name": "Overridden Name"},
+            }
+        }
+    )
+
+    f1 = tmp_path / "p1.json"
+    f1.write_text(json.dumps({"name": "Original Name", "tracks": []}), encoding="utf-8")
+    f2 = tmp_path / "p2.json"
+    f2.write_text(json.dumps({"name": "Second List", "tracks": []}), encoding="utf-8")
+
+    # Valid: single file with --name
+    res_single = runner.invoke(app, ["import", str(f1), "--name", "Overridden Name"])
+    assert res_single.exit_code == 0
+    assert "Overridden Name" in res_single.stdout
+    assert create_route.called
+
+    # Invalid: multiple files with --name
+    res_multi = runner.invoke(app, ["import", str(f1), str(f2), "--name", "Bad Override"])
+    assert res_multi.exit_code == 1
+    assert "Cannot use --name when importing multiple playlist files" in (res_multi.stderr + res_multi.stdout)
+
+
+@respx.mock
+def test_cli_import_conflict_modes(
+    tmp_path: Path,
+    mock_subsonic_playlists_response: dict,
+) -> None:
+    """Verify CLI --on-conflict options (skip, replace, append, rename)."""
+    respx.get("http://navidrome.local:4533/rest/getPlaylists").respond(json=mock_subsonic_playlists_response)
+    respx.get("http://navidrome.local:4533/rest/getSong").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "song": {"id": "trk-101", "title": "Bohemian Rhapsody", "duration": 354},
+            }
+        }
+    )
+    respx.get("http://navidrome.local:4533/rest/getPlaylist").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "playlist": {
+                    "id": "pl-1",
+                    "name": "Rock Anthems",
+                    "entry": [{"id": "trk-101", "title": "Bohemian Rhapsody", "duration": 354}],
+                },
+            }
+        }
+    )
+    respx.post("http://navidrome.local:4533/rest/createPlaylist").respond(
+        json={
+            "subsonic-response": {
+                "status": "ok",
+                "version": "1.16.1",
+                "playlist": {"id": "pl-renamed", "name": "Rock Anthems (Imported)"},
+            }
+        }
+    )
+    respx.post("http://navidrome.local:4533/rest/updatePlaylist").respond(
+        json={"subsonic-response": {"status": "ok", "version": "1.16.1"}}
+    )
+
+    # Rock Anthems exists and is owned by testuser
+    pl_file = tmp_path / "rock_import.json"
+    pl_file.write_text(
+        json.dumps(
+            {
+                "name": "Rock Anthems",
+                "tracks": [{"id": "trk-101", "title": "Bohemian Rhapsody", "duration": 354}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. skip
+    res_skip = runner.invoke(app, ["import", str(pl_file), "--on-conflict", "skip"])
+    assert res_skip.exit_code == 0
+    assert "skipped" in res_skip.stdout
+
+    # 2. replace
+    res_replace = runner.invoke(app, ["import", str(pl_file), "--on-conflict", "replace"])
+    assert res_replace.exit_code == 0
+    assert "replaced" in res_replace.stdout
+
+    # 3. rename
+    res_rename = runner.invoke(app, ["import", str(pl_file), "--on-conflict", "rename"])
+    assert res_rename.exit_code == 0
+    assert "renamed" in res_rename.stdout
+    assert "Rock Anthems" in res_rename.stdout
+    assert "(Imported)" in res_rename.stdout
+
+
+def test_cli_import_validation_errors(tmp_path: Path) -> None:
+    """Verify validation errors for invalid --min-confidence, bad --on-conflict, or empty dir."""
+    dummy_file = tmp_path / "dummy.json"
+    dummy_file.write_text("{}", encoding="utf-8")
+
+    # Invalid confidence
+    res_conf = runner.invoke(app, ["import", str(dummy_file), "--min-confidence", "1.5"])
+    assert res_conf.exit_code == 1
+    assert "--min-confidence must be between 0.0 and 1.0" in (res_conf.stderr + res_conf.stdout)
+
+    # Invalid conflict
+    res_conf_strat = runner.invoke(app, ["import", str(dummy_file), "--on-conflict", "explode"])
+    assert res_conf_strat.exit_code == 1
+    assert "Invalid --on-conflict strategy" in (res_conf_strat.stderr + res_conf_strat.stdout)
+
+    # Empty directory
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    res_empty = runner.invoke(app, ["import", str(empty_dir)])
+    assert res_empty.exit_code == 1
+    assert "No supported playlist files" in (res_empty.stderr + res_empty.stdout)
+

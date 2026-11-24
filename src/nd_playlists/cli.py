@@ -24,6 +24,16 @@ from nd_playlists.client import (
     SubsonicTimeoutError,
 )
 from nd_playlists.config import ConfigError, load_config
+from nd_playlists.importer import (
+    ImportResult,
+    ImportedPlaylist,
+    ImportedTrack,
+    InvalidPlaylistFileError,
+    PlaylistImportError,
+    ResolutionCache,
+    import_playlist,
+    load_playlist_file,
+)
 from nd_playlists.models import Playlist
 
 PASSWORD_HELP = (
@@ -51,6 +61,12 @@ def handle_errors() -> Generator[None, None, None]:
         raise
     except ConfigError as exc:
         err_console.print(f"[bold red]Configuration Error:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
+    except InvalidPlaylistFileError as exc:
+        err_console.print(f"[bold red]Invalid Playlist File:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
+    except PlaylistImportError as exc:
+        err_console.print(f"[bold red]Import Error:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1)
     except SubsonicTimeoutError as exc:
         err_console.print(f"[bold red]Timeout Error:[/bold red] {escape(str(exc))}")
@@ -592,64 +608,408 @@ def rm_cmd(
 @app.command("export")
 def export_cmd(
     ctx: typer.Context,
-    identifier: str = typer.Argument(
-        ..., help="Playlist ID or exact name to export"
+    identifiers: Optional[List[str]] = typer.Argument(
+        None, help="One or more playlist IDs or exact names to export"
+    ),
+    all_playlists: bool = typer.Option(
+        False, "--all", help="Export all playlists"
+    ),
+    pattern: Optional[str] = typer.Option(
+        None, "--pattern", "-p", help="Target playlists matching a wildcard glob (e.g. 'Rock*')"
+    ),
+    owner: Optional[str] = typer.Option(
+        None, "--owner", help="Filter playlists to export by owner username"
     ),
     format: str = typer.Option(
         "json", "--format", "-f", help="Export format: 'json' or 'm3u8'"
     ),
     output: Optional[Path] = typer.Option(
-        None, "--output", "-o", help="Target output file path"
+        None, "--output", "-o", help="Target output file path (single playlist only)"
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", "-d", help="Target output directory for bulk export"
     ),
     force: bool = typer.Option(
-        False, "--force", "-F", help="Overwrite existing output file"
+        False, "--force", "-F", help="Overwrite existing output file(s)"
     ),
     url: Optional[str] = typer.Option(None, "--url", "-u", help="Override Navidrome server URL"),
     user: Optional[str] = typer.Option(None, "--user", "-U", help="Override Navidrome username"),
     password: Optional[str] = typer.Option(None, "--password", "-P", help=PASSWORD_HELP),
     timeout: Optional[float] = typer.Option(None, "--timeout", "-t", help="Override HTTP request timeout in seconds"),
 ) -> None:
-    """Export a playlist's metadata and tracklist to .json or .m3u8."""
+    """Export one or more playlists' metadata and tracklist to .json or .m3u8."""
     with handle_errors():
         fmt = format.lower()
         if fmt not in ("json", "m3u8"):
             raise ConfigError(f"Invalid format '{format}'. Supported formats are 'json' and 'm3u8'.")
 
-        with get_client(ctx, url, user, password, timeout) as client:
-            target = client.resolve_playlist(identifier)
-            playlist = client.get_playlist(target.id)
+        if not identifiers and not all_playlists and not pattern:
+            raise ConfigError(
+                "No playlists specified to export. Specify one or more playlist identifiers, or use --all or --pattern <glob>."
+            )
 
-            if fmt == "json":
-                content = json.dumps(playlist.to_dict(), indent=2, ensure_ascii=False)
-                ext = ".json"
-            else:
-                content = playlist.to_m3u8()
-                ext = ".m3u8"
+        if output and output_dir:
+            raise ConfigError("Cannot specify both --output and --output-dir.")
+
+        with get_client(ctx, url, user, password, timeout) as client:
+            all_server_playlists = client.get_playlists()
+            targets: dict[str, Playlist] = {}
+
+            if identifiers:
+                for ident in identifiers:
+                    target = client.resolve_playlist(ident, playlists=all_server_playlists)
+                    if owner and (not target.owner or target.owner.lower() != owner.lower()):
+                        continue
+                    targets[target.id] = target
+
+            if all_playlists or pattern:
+                for p in all_server_playlists:
+                    if owner and (not p.owner or p.owner.lower() != owner.lower()):
+                        continue
+                    if pattern and not fnmatch.fnmatch(p.name.lower(), pattern.lower()):
+                        continue
+                    targets[p.id] = p
+
+            if not targets:
+                console.print(
+                    "[yellow]No playlists matched or targeted for export.[/yellow]"
+                )
+                return
+
+            target_list = list(targets.values())
+
+            if len(target_list) > 1 and output is not None:
+                raise ConfigError(
+                    "Cannot use --output when exporting multiple playlists. Use --output-dir / -d instead."
+                )
+
+            # Determine export plan (target path for each playlist)
+            export_plan: list[tuple[Playlist, Path]] = []
+            ext = f".{fmt}"
 
             if output:
+                # Single playlist with explicit output file
                 out_path = output
+                if out_path.is_dir():
+                    raise ConfigError(
+                        f"Target output path '{out_path}' is an existing directory, not a file."
+                    )
+                export_plan.append((target_list[0], out_path))
+            elif output_dir:
+                # Target output directory specified
+                out_dir = output_dir
+                name_counts: dict[str, int] = {}
+                for p in target_list:
+                    s_name = sanitize_filename(p.name)
+                    name_counts[s_name] = name_counts.get(s_name, 0) + 1
+
+                for p in target_list:
+                    s_name = sanitize_filename(p.name)
+                    s_id = sanitize_filename(p.id)
+                    filename = f"{s_name}_{s_id}{ext}" if name_counts[s_name] > 1 else f"{s_name}{ext}"
+                    export_plan.append((p, out_dir / filename))
             else:
-                safe_name = sanitize_filename(playlist.name)
-                out_path = Path(f"{safe_name}{ext}")
+                # Neither --output nor --output-dir passed
+                if len(target_list) == 1:
+                    s_name = sanitize_filename(target_list[0].name)
+                    export_plan.append((target_list[0], Path(f"{s_name}{ext}")))
+                else:
+                    out_dir = Path(".")
+                    name_counts = {}
+                    for p in target_list:
+                        s_name = sanitize_filename(p.name)
+                        name_counts[s_name] = name_counts.get(s_name, 0) + 1
 
-            if out_path.is_dir():
-                raise ConfigError(
-                    f"Target output path '{out_path}' is an existing directory, not a file."
+                    for p in target_list:
+                        s_name = sanitize_filename(p.name)
+                        s_id = sanitize_filename(p.id)
+                        filename = f"{s_name}_{s_id}{ext}" if name_counts[s_name] > 1 else f"{s_name}{ext}"
+                        export_plan.append((p, out_dir / filename))
+
+            # Validate overwrite protection upfront before writing
+            if not force:
+                for _, plan_path in export_plan:
+                    if plan_path.exists():
+                        raise ConfigError(
+                            f"Target output file '{plan_path}' already exists. Use --force / -F to overwrite."
+                        )
+
+            # Execute exports
+            is_bulk = bool(all_playlists or pattern or output_dir or (identifiers and len(identifiers) > 1))
+            if not is_bulk and len(export_plan) == 1:
+                target_pl, out_path = export_plan[0]
+                full_pl = client.get_playlist(target_pl.id)
+                if fmt == "json":
+                    content = json.dumps(full_pl.to_dict(), indent=2, ensure_ascii=False)
+                else:
+                    content = full_pl.to_m3u8()
+
+                if out_path.parent and not out_path.parent.exists():
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                out_path.write_text(content, encoding="utf-8")
+                console.print(
+                    f"[green]✓[/green] Exported playlist '[bold]{escape(full_pl.name)}[/]' "
+                    f"({len(full_pl.tracks)} tracks) to [bold cyan]{escape(str(out_path))}[/bold cyan] ({len(content.encode('utf-8'))} bytes)"
+                )
+            else:
+                table = Table(
+                    title=f"Exported Playlists ({len(export_plan)})",
+                    border_style="green",
+                )
+                table.add_column("Playlist Name", style="bold white")
+                table.add_column("ID", style="cyan", no_wrap=True)
+                table.add_column("Tracks", justify="right")
+                table.add_column("Duration", justify="right")
+                table.add_column("Output File", style="bold cyan")
+                table.add_column("Size", justify="right", style="dim")
+
+                for target_pl, out_path in export_plan:
+                    full_pl = client.get_playlist(target_pl.id)
+                    if fmt == "json":
+                        content = json.dumps(full_pl.to_dict(), indent=2, ensure_ascii=False)
+                    else:
+                        content = full_pl.to_m3u8()
+
+                    if out_path.parent and not out_path.parent.exists():
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    out_path.write_text(content, encoding="utf-8")
+                    content_bytes = len(content.encode("utf-8"))
+                    size_str = f"{content_bytes / 1024:.1f} KB" if content_bytes >= 1024 else f"{content_bytes} B"
+
+                    table.add_row(
+                        escape(full_pl.name),
+                        full_pl.id,
+                        str(full_pl.song_count),
+                        full_pl.formatted_duration,
+                        escape(str(out_path)),
+                        size_str,
+                    )
+
+                console.print(table)
+                console.print(
+                    f"\n[bold green]Successfully exported {len(export_plan)} playlist(s).[/bold green]"
                 )
 
-            if out_path.exists() and not force:
-                raise ConfigError(
-                    f"Target output file '{out_path}' already exists. Use --force / -F to overwrite."
-                )
 
-            if out_path.parent and not out_path.parent.exists():
-                out_path.parent.mkdir(parents=True, exist_ok=True)
+@app.command("import")
+def import_cmd(
+    ctx: typer.Context,
+    paths: List[Path] = typer.Argument(
+        ...,
+        exists=True,
+        help="One or more .json/.m3u8 files or directories containing playlist files",
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", "-n", help="Override playlist name (single file import only)"
+    ),
+    on_conflict: str = typer.Option(
+        "skip",
+        "--on-conflict",
+        help="Conflict resolution strategy: 'skip', 'replace', 'append', or 'rename'",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview track matching and import actions without modifying server"
+    ),
+    min_confidence: float = typer.Option(
+        0.80, "--min-confidence", help="Fuzzy metadata matching threshold between 0.0 and 1.0"
+    ),
+    skip_id_lookup: bool = typer.Option(
+        False, "--skip-id-lookup", help="Skip exact ID lookup and match tracks by path or metadata"
+    ),
+    allow_duplicates: bool = typer.Option(
+        False, "--allow-duplicates", help="Allow duplicate track IDs when using --on-conflict append"
+    ),
+    report: Optional[Path] = typer.Option(
+        None, "--report", help="Path to write JSON report of unmatched tracks"
+    ),
+    url: Optional[str] = typer.Option(None, "--url", "-u", help="Override Navidrome server URL"),
+    user: Optional[str] = typer.Option(None, "--user", "-U", help="Override Navidrome username"),
+    password: Optional[str] = typer.Option(None, "--password", "-P", help=PASSWORD_HELP),
+    timeout: Optional[float] = typer.Option(None, "--timeout", "-t", help="Override HTTP request timeout in seconds"),
+) -> None:
+    """Import playlists from .json or .m3u8 files into Navidrome."""
+    with handle_errors():
+        if not (0.0 <= min_confidence <= 1.0):
+            raise ConfigError("--min-confidence must be between 0.0 and 1.0.")
 
-            out_path.write_text(content, encoding="utf-8")
-            console.print(
-                f"[green]✓[/green] Exported playlist '[bold]{escape(playlist.name)}[/]' "
-                f"({len(playlist.tracks)} tracks) to [bold cyan]{escape(str(out_path))}[/bold cyan] ({len(content.encode('utf-8'))} bytes)"
+        conflict_strat = on_conflict.lower().strip()
+        if conflict_strat not in ("skip", "replace", "append", "rename"):
+            raise ConfigError(
+                f"Invalid --on-conflict strategy '{on_conflict}'. Must be one of: skip, replace, append, rename."
             )
+
+        # Discover files
+        files_to_import: list[Path] = []
+        for p in paths:
+            if p.is_dir():
+                found = [
+                    f
+                    for f in p.iterdir()
+                    if f.is_file() and f.suffix.lower() in (".json", ".m3u8", ".m3u")
+                ]
+                found.sort(key=lambda f: f.name.lower())
+                files_to_import.extend(found)
+            elif p.is_file():
+                if p.suffix.lower() in (".json", ".m3u8", ".m3u"):
+                    files_to_import.append(p)
+                else:
+                    raise ConfigError(
+                        f"Unsupported playlist file format for '{p}'. Supported formats: .json, .m3u8, .m3u"
+                    )
+
+        if not files_to_import:
+            console.print("[yellow]No supported playlist files (.json, .m3u8, .m3u) found in target path(s).[/yellow]")
+            raise typer.Exit(code=1)
+
+        if name is not None and len(files_to_import) > 1:
+            raise ConfigError("Cannot use --name when importing multiple playlist files.")
+
+        with get_client(ctx, url, user, password, timeout) as client:
+            cache = ResolutionCache()
+            results: list[ImportResult] = []
+            parse_errors: list[tuple[Path, str]] = []
+
+            for file_path in files_to_import:
+                try:
+                    imported_pl = load_playlist_file(file_path)
+                except (InvalidPlaylistFileError, Exception) as exc:
+                    parse_errors.append((file_path, str(exc)))
+                    err_console.print(f"[red]Error parsing '{escape(str(file_path))}':[/red] {escape(str(exc))}")
+                    continue
+
+                res = import_playlist(
+                    client=client,
+                    imported=imported_pl,
+                    on_conflict=conflict_strat,  # type: ignore[arg-type]
+                    dry_run=dry_run,
+                    min_confidence=min_confidence,
+                    skip_id_lookup=skip_id_lookup,
+                    allow_duplicates=allow_duplicates,
+                    name_override=name if len(files_to_import) == 1 else None,
+                    cache=cache,
+                )
+                results.append(res)
+
+            if not results:
+                err_console.print("[bold red]All playlist imports failed.[/bold red]")
+                raise typer.Exit(code=1)
+
+            # Summary Table
+            title_prefix = "Playlist Import Preview (DRY RUN)" if dry_run else "Playlist Import Summary"
+            table = Table(
+                title=f"{title_prefix} ({len(results)}/{len(files_to_import)})",
+                border_style="yellow" if dry_run else "blue",
+            )
+            table.add_column("Playlist Name", style="bold white")
+            table.add_column("Action", justify="center")
+            table.add_column("Matched Tracks", justify="left")
+            table.add_column("Unmatched", justify="right")
+            table.add_column("Playlist ID", style="cyan", no_wrap=True)
+
+            action_styles = {
+                "created": "[bold green]created[/bold green]",
+                "replaced": "[bold yellow]replaced[/bold yellow]",
+                "appended": "[bold cyan]appended[/bold cyan]",
+                "renamed": "[bold magenta]renamed[/bold magenta]",
+                "skipped": "[dim]skipped[/dim]",
+                "dry-run": "[bold yellow]dry-run[/bold yellow]",
+            }
+
+            all_unmatched: list[tuple[str, ImportedTrack]] = []
+
+            for r in results:
+                act_str = action_styles.get(r.action, r.action)
+                bd = r.match_breakdown
+                matched_detail = (
+                    f"{r.matched_count} [dim](ID: {bd.get('id', 0)}, "
+                    f"Path: {bd.get('path', 0)}, Meta: {bd.get('metadata', 0)})[/dim]"
+                )
+                unmatched_count = len(r.unmatched_tracks)
+                unm_str = (
+                    f"[bold red]{unmatched_count}[/bold red]"
+                    if unmatched_count > 0
+                    else "[green]0[/green]"
+                )
+                pl_id_str = r.playlist_id or "-"
+
+                table.add_row(
+                    escape(r.playlist_name),
+                    act_str,
+                    matched_detail,
+                    unm_str,
+                    pl_id_str,
+                )
+
+                for trk in r.unmatched_tracks:
+                    all_unmatched.append((r.playlist_name, trk))
+
+            console.print(table)
+
+            # Unmatched Tracks details
+            if all_unmatched:
+                unm_table = Table(
+                    title=f"Unmatched Tracks ({len(all_unmatched)})",
+                    border_style="red",
+                )
+                unm_table.add_column("Playlist", style="magenta")
+                unm_table.add_column("Title", style="bold white")
+                unm_table.add_column("Artist", style="cyan")
+                unm_table.add_column("Album", style="dim")
+                unm_table.add_column("Path / URI", style="dim")
+
+                for pl_name, trk in all_unmatched:
+                    unm_table.add_row(
+                        escape(pl_name),
+                        escape(trk.title),
+                        escape(trk.display_artist),
+                        escape(trk.display_album),
+                        escape(trk.path or trk.raw_uri or "-"),
+                    )
+
+                console.print(unm_table)
+
+            # Write report if requested
+            if report is not None:
+                report_data = {
+                    "summary": {
+                        "total_files": len(files_to_import),
+                        "imported": len(results),
+                        "failed_files": len(parse_errors),
+                        "total_unmatched_tracks": len(all_unmatched),
+                        "dry_run": dry_run,
+                    },
+                    "playlists": [
+                        {
+                            "playlist_name": r.playlist_name,
+                            "action": r.action,
+                            "playlist_id": r.playlist_id,
+                            "matched_count": r.matched_count,
+                            "match_breakdown": r.match_breakdown,
+                            "unmatched_count": len(r.unmatched_tracks),
+                            "unmatched_tracks": [
+                                {
+                                    "title": t.title,
+                                    "artist": t.artist,
+                                    "album": t.album,
+                                    "duration": t.duration,
+                                    "path": t.path,
+                                    "raw_uri": t.raw_uri,
+                                }
+                                for t in r.unmatched_tracks
+                            ],
+                        }
+                        for r in results
+                    ],
+                }
+                if report.parent and not report.parent.exists():
+                    report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding="utf-8")
+                console.print(f"[dim]Wrote unmatched tracks report to {escape(str(report))}[/dim]")
+
+            if parse_errors and not results:
+                raise typer.Exit(code=1)
 
 
 @app.command("update")

@@ -1,7 +1,7 @@
 """Data models for Subsonic playlists and tracks."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 
@@ -70,23 +70,29 @@ class Track:
         return self.album or "Unknown Album"
 
     @classmethod
-    def from_subsonic_dict(cls, data: dict[str, Any]) -> "Track":
-        """Parse Subsonic track entry dictionary."""
+    def from_dict(cls, data: dict[str, Any]) -> "Track":
+        """Parse track from dictionary (supporting export format and Subsonic raw dict)."""
         parsed_duration = _safe_int(data.get("duration"), default=0)
+        track_num = _safe_int(data.get("trackNumber") if "trackNumber" in data else data.get("track"), default=None)
         return cls(
             id=str(data.get("id", "")),
             title=str(data.get("title") or "Unknown Title"),
             artist=data.get("artist"),
             album=data.get("album"),
             duration=parsed_duration if parsed_duration is not None else 0,
-            track_number=_safe_int(data.get("track"), default=None),
+            track_number=track_num,
             year=_safe_int(data.get("year"), default=None),
             genre=data.get("genre"),
             size=_safe_int(data.get("size"), default=None),
-            content_type=data.get("contentType"),
+            content_type=data.get("contentType") or data.get("content_type"),
             suffix=data.get("suffix"),
             path=data.get("path"),
         )
+
+    @classmethod
+    def from_subsonic_dict(cls, data: dict[str, Any]) -> "Track":
+        """Parse Subsonic track entry dictionary."""
+        return cls.from_dict(data)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert track to serializable dictionary."""
@@ -182,9 +188,52 @@ class Playlist:
             tracks=tracks,
         )
 
+    @classmethod
+    def from_export_dict(cls, data: dict[str, Any]) -> "Playlist":
+        """Parse exported JSON playlist dictionary (supporting schema v1, legacy backups, and Subsonic format)."""
+        raw_tracks = data.get("tracks")
+        if raw_tracks is None:
+            raw_tracks = data.get("entry") or []
+        if isinstance(raw_tracks, dict):
+            raw_tracks = [raw_tracks]
+
+        tracks = [
+            Track.from_dict(item)
+            for item in raw_tracks
+            if isinstance(item, dict)
+        ]
+
+        raw_public = data.get("public", False)
+        if isinstance(raw_public, str):
+            public = raw_public.lower() in ("true", "1", "yes")
+        else:
+            public = bool(raw_public)
+
+        parsed_song_count = _safe_int(data.get("songCount") if "songCount" in data else data.get("song_count"))
+        song_count = parsed_song_count if parsed_song_count is not None else len(tracks)
+
+        parsed_duration = _safe_int(data.get("duration"))
+        duration = parsed_duration if parsed_duration is not None else sum(t.duration for t in tracks)
+
+        return cls(
+            id=str(data.get("id", "")),
+            name=str(data.get("name") or "Untitled"),
+            comment=data.get("comment"),
+            owner=data.get("owner"),
+            public=public,
+            song_count=song_count,
+            duration=duration,
+            created=data.get("created"),
+            changed=data.get("changed"),
+            cover_art=data.get("coverArt") or data.get("cover_art"),
+            tracks=tracks,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Convert playlist and all its tracks to dictionary for JSON export."""
         return {
+            "schemaVersion": 1,
+            "exportedAt": datetime.now(timezone.utc).isoformat(),
             "id": self.id,
             "name": self.name,
             "comment": self.comment,
