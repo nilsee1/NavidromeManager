@@ -5,6 +5,28 @@ from datetime import datetime
 from typing import Any, Optional
 
 
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    """Gracefully parse an integer handling None, empty strings, floats, and tags like '1/12'."""
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    val_str = str(value).strip()
+    if not val_str:
+        return default
+    if "/" in val_str:
+        val_str = val_str.split("/")[0].strip()
+    try:
+        return int(val_str)
+    except (ValueError, TypeError):
+        try:
+            return int(float(val_str))
+        except (ValueError, TypeError):
+            return default
+
+
 def format_duration(seconds: Optional[int | float]) -> str:
     """Format duration in seconds to HH:MM:SS."""
     if seconds is None or seconds < 0:
@@ -50,16 +72,17 @@ class Track:
     @classmethod
     def from_subsonic_dict(cls, data: dict[str, Any]) -> "Track":
         """Parse Subsonic track entry dictionary."""
+        parsed_duration = _safe_int(data.get("duration"), default=0)
         return cls(
             id=str(data.get("id", "")),
             title=str(data.get("title") or "Unknown Title"),
             artist=data.get("artist"),
             album=data.get("album"),
-            duration=int(data.get("duration", 0)) if data.get("duration") is not None else 0,
-            track_number=int(data["track"]) if data.get("track") is not None else None,
-            year=int(data["year"]) if data.get("year") is not None else None,
+            duration=parsed_duration if parsed_duration is not None else 0,
+            track_number=_safe_int(data.get("track"), default=None),
+            year=_safe_int(data.get("year"), default=None),
             genre=data.get("genre"),
-            size=int(data["size"]) if data.get("size") is not None else None,
+            size=_safe_int(data.get("size"), default=None),
             content_type=data.get("contentType"),
             suffix=data.get("suffix"),
             path=data.get("path"),
@@ -113,6 +136,8 @@ class Playlist:
         try:
             # Handle ISO-8601 strings
             dt = datetime.fromisoformat(self.changed.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, TypeError):
             return str(self.changed)
@@ -121,10 +146,14 @@ class Playlist:
     def from_subsonic_dict(cls, data: dict[str, Any]) -> "Playlist":
         """Parse Subsonic playlist dictionary."""
         # Parse tracks if present in `entry`
-        raw_entries = data.get("entry", [])
+        raw_entries = data.get("entry") or []
         if isinstance(raw_entries, dict):
             raw_entries = [raw_entries]
-        tracks = [Track.from_subsonic_dict(entry) for entry in raw_entries]
+        tracks = [
+            Track.from_subsonic_dict(entry)
+            for entry in raw_entries
+            if isinstance(entry, dict)
+        ]
 
         # Public flag can be boolean or string
         raw_public = data.get("public", False)
@@ -133,8 +162,11 @@ class Playlist:
         else:
             public = bool(raw_public)
 
-        song_count = int(data.get("songCount", len(tracks)))
-        duration = int(data.get("duration", sum(t.duration for t in tracks)))
+        parsed_song_count = _safe_int(data.get("songCount"))
+        song_count = parsed_song_count if parsed_song_count is not None else len(tracks)
+
+        parsed_duration = _safe_int(data.get("duration"))
+        duration = parsed_duration if parsed_duration is not None else sum(t.duration for t in tracks)
 
         return cls(
             id=str(data.get("id", "")),
@@ -169,14 +201,26 @@ class Playlist:
 
     def to_m3u8(self) -> str:
         """Generate standard Extended M3U8 content for the playlist."""
+        def _clean_str(val: str) -> str:
+            return val.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+
+        clean_name = _clean_str(self.name)
         lines = [
             "#EXTM3U",
-            f"#PLAYLIST:{self.name}",
+            f"#PLAYLIST:{clean_name}",
         ]
         for track in self.tracks:
-            lines.append(f"#EXTINF:{track.duration},{track.display_artist} - {track.title}")
-            # Use path if available, else fallback to formatted filename
-            uri = track.path or f"{track.display_artist} - {track.title}.{track.suffix or 'mp3'}"
+            artist = _clean_str(track.display_artist)
+            title = _clean_str(track.title)
+            lines.append(f"#EXTINF:{track.duration},{artist} - {title}")
+            if track.path:
+                uri = _clean_str(track.path)
+            else:
+                safe_artist = artist.replace("/", "_").replace("\\", "_")
+                safe_title = title.replace("/", "_").replace("\\", "_")
+                suffix = _clean_str(track.suffix or "mp3").lstrip(".")
+                uri = f"{safe_artist} - {safe_title}.{suffix}"
+                uri = _clean_str(uri)
             lines.append(uri)
 
         return "\n".join(lines) + "\n"

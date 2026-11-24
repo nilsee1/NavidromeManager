@@ -1,9 +1,10 @@
 """Configuration management for nd-playlists."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Optional
+import urllib.parse
 from dotenv import load_dotenv
 
 
@@ -18,7 +19,7 @@ class Config:
 
     url: str
     user: str
-    password: str
+    password: str = field(repr=False)
     timeout: float = 10.0
 
 
@@ -41,9 +42,12 @@ def load_config(
         # Load default .env from current directory or parents
         load_dotenv(override=False)
 
-    resolved_url = url or os.getenv("NAVIDROME_URL")
-    resolved_user = user or os.getenv("NAVIDROME_USER")
-    resolved_password = password or os.getenv("NAVIDROME_PASSWORD")
+    raw_url = url if url is not None else os.getenv("NAVIDROME_URL")
+    raw_user = user if user is not None else os.getenv("NAVIDROME_USER")
+    resolved_password = password if password is not None else os.getenv("NAVIDROME_PASSWORD")
+
+    resolved_url = raw_url.strip() if raw_url is not None else ""
+    resolved_user = raw_user.strip() if raw_user is not None else ""
 
     missing = []
     if not resolved_url:
@@ -59,14 +63,31 @@ def load_config(
             "Please provide them as CLI arguments or set them in a .env file."
         )
 
-    # Normalize URL: strip whitespace and trailing slashes
-    clean_url = resolved_url.strip().rstrip("/")
-    if not clean_url.startswith(("http://", "https://")):
-        clean_url = f"http://{clean_url}"
+    # Validate timeout
+    try:
+        timeout_val = float(timeout)
+    except (ValueError, TypeError):
+        raise ConfigError(f"Invalid timeout '{timeout}': timeout must be a valid number.")
+
+    if timeout_val <= 0:
+        raise ConfigError(f"Invalid timeout '{timeout}': timeout must be greater than 0.")
+
+    # Validate URL: explicitly require scheme (http:// or https://) and valid hostname
+    clean_url = resolved_url.rstrip("/")
+    if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+        raise ConfigError(
+            f"Invalid URL '{clean_url}': URL must explicitly start with 'http://' or 'https://'."
+        )
+
+    parsed = urllib.parse.urlparse(clean_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ConfigError(
+            f"Invalid URL '{clean_url}': URL must include a valid hostname."
+        )
 
     return Config(
         url=clean_url,
-        user=resolved_user.strip(),
+        user=resolved_user,
         password=resolved_password,
-        timeout=max(1.0, float(timeout)),
+        timeout=timeout_val,
     )
