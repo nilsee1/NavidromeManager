@@ -56,7 +56,7 @@ class SubsonicClient:
     def __init__(self, config: Config, http_client: Optional[httpx.Client] = None) -> None:
         self.config = config
         self._owns_client = http_client is None
-        self.client = http_client or httpx.Client(timeout=config.timeout)
+        self.client = http_client or httpx.Client(timeout=config.timeout, follow_redirects=True)
 
     def close(self) -> None:
         """Close the underlying HTTP client if owned."""
@@ -87,19 +87,30 @@ class SubsonicClient:
             "f": "json",
         }
 
-    def _request(self, endpoint: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        """Perform a GET request to <NAVIDROME_URL>/rest/<endpoint> and validate the response."""
+    def _request(
+        self,
+        endpoint: str,
+        params: Optional[dict[str, Any]] = None,
+        method: str = "GET",
+    ) -> dict[str, Any]:
+        """Perform an HTTP request to <NAVIDROME_URL>/rest/<endpoint> and validate the response."""
         clean_endpoint = endpoint.strip().lstrip("/")
         url = f"{self.config.url}/rest/{clean_endpoint}"
 
-        query_params = self._get_auth_params()
+        payload = self._get_auth_params()
         if params:
             for k, v in params.items():
                 if v is not None:
-                    query_params[k] = str(v)
+                    payload[k] = str(v)
 
         try:
-            response = self.client.get(url, params=query_params)
+            method_upper = method.upper()
+            if method_upper == "POST":
+                response = self.client.post(url, data=payload)
+            elif method_upper == "GET":
+                response = self.client.get(url, params=payload)
+            else:
+                response = self.client.request(method_upper, url, params=payload)
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise SubsonicTimeoutError(
@@ -125,6 +136,11 @@ class SubsonicClient:
                 code=-1, message="Server response was not valid JSON."
             ) from exc
 
+        if not isinstance(data, dict):
+            raise SubsonicAPIError(
+                code=-1, message="Server response was not a valid JSON object."
+            )
+
         subsonic_response = data.get("subsonic-response")
         if not isinstance(subsonic_response, dict):
             raise SubsonicAPIError(
@@ -133,9 +149,13 @@ class SubsonicClient:
 
         status = subsonic_response.get("status")
         if status == "failed":
-            error_data = subsonic_response.get("error", {})
-            code = int(error_data.get("code", 0))
-            message = error_data.get("message", "Unknown Subsonic error occurred.")
+            error_data = subsonic_response.get("error") or {}
+            raw_code = error_data.get("code", 0)
+            try:
+                code = int(raw_code)
+            except (ValueError, TypeError):
+                code = 0
+            message = str(error_data.get("message") or "Unknown Subsonic error occurred.")
             raise SubsonicAPIError(code=code, message=message)
 
         if status != "ok":
@@ -159,11 +179,11 @@ class SubsonicClient:
     def get_playlists(self) -> list[Playlist]:
         """Fetch all playlists via /rest/getPlaylists."""
         resp = self._request("getPlaylists")
-        playlists_container = resp.get("playlists", {})
-        raw_list = playlists_container.get("playlist", [])
+        playlists_container = resp.get("playlists") or {}
+        raw_list = playlists_container.get("playlist") or []
         if isinstance(raw_list, dict):
             raw_list = [raw_list]
-        return [Playlist.from_subsonic_dict(item) for item in raw_list]
+        return [Playlist.from_subsonic_dict(item) for item in raw_list if isinstance(item, dict)]
 
     def get_playlist(self, playlist_id: str) -> Playlist:
         """Fetch a single playlist with full tracklist via /rest/getPlaylist."""
@@ -175,7 +195,7 @@ class SubsonicClient:
 
     def delete_playlist(self, playlist_id: str) -> None:
         """Delete a playlist via /rest/deletePlaylist."""
-        self._request("deletePlaylist", {"id": playlist_id})
+        self._request("deletePlaylist", {"id": playlist_id}, method="POST")
 
     def update_playlist(
         self,
@@ -193,16 +213,20 @@ class SubsonicClient:
         if public is not None:
             params["public"] = "true" if public else "false"
 
-        self._request("updatePlaylist", params)
+        self._request("updatePlaylist", params, method="POST")
 
-    def resolve_playlist(self, identifier: str) -> Playlist:
+    def resolve_playlist(
+        self,
+        identifier: str,
+        playlists: Optional[list[Playlist]] = None,
+    ) -> Playlist:
         """Resolve a playlist by exact ID first, or by case-insensitive exact name match.
 
         Raises:
             PlaylistAmbiguityError: When multiple playlists have the same matching name.
             PlaylistNotFoundError: When no matching playlist is found.
         """
-        all_playlists = self.get_playlists()
+        all_playlists = playlists if playlists is not None else self.get_playlists()
 
         # 1. Check exact ID match
         for p in all_playlists:
